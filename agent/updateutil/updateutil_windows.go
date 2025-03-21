@@ -34,21 +34,24 @@ import (
 	"github.com/aws/amazon-ssm-agent/agent/log"
 	"github.com/aws/amazon-ssm-agent/agent/platform"
 	model "github.com/aws/amazon-ssm-agent/agent/runcommand/contracts"
+	"github.com/aws/amazon-ssm-agent/agent/updateutil/updateconstants"
 	"github.com/cenkalti/backoff/v4"
+	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
 var (
-	getPlatformSku           = platform.PlatformSku
-	readDir                  = fileutil.ReadDir
-	unmarshallFile           = jsonutil.UnmarshalFile
-	sleep                    = time.Sleep
-	fileExists               = fileutil.Exists
-	backoffConfigExponential = backoffconfig.GetExponentialBackoff
-	backOffRetry             = backoff.Retry
-	deleteFile               = fileutil.DeleteFile
-	fileWrite                = fileutil.WriteIntoFileWithPermissions
+	getPlatformSku                  = platform.PlatformSku
+	readDir                         = fileutil.ReadDir
+	unmarshallFile                  = jsonutil.UnmarshalFile
+	sleep                           = time.Sleep
+	fileExists                      = fileutil.Exists
+	backoffConfigExponential        = backoffconfig.GetExponentialBackoff
+	backOffRetry                    = backoff.Retry
+	deleteFile                      = fileutil.DeleteFile
+	fileWrite                       = fileutil.WriteIntoFileWithPermissions
+	getVersionThroughRegistryKeyRef = getVersionThroughRegistryKey
 )
 
 type UpdatePluginRunState struct {
@@ -329,4 +332,27 @@ func setPlatformSpecificCommand(parts []string) []string {
 // ResolveUpdateRoot returns the platform specific path to update artifacts
 func ResolveUpdateRoot(sourceVersion string) (string, error) {
 	return appconfig.UpdaterArtifactsRoot, nil
+}
+
+func verifyVersion(log log.T, targetVersion string) updateconstants.ErrorCode {
+	log.Infof("Verifying Agent version using Registry")
+	registryCurrentAgentVersion := getVersionThroughRegistryKeyRef(log)
+	if targetVersion == registryCurrentAgentVersion {
+		return "" // success code
+	}
+	return updateconstants.ErrorInstTargetVersionNotFoundViaReg
+}
+
+func getVersionThroughRegistryKey(log log.T) string {
+	key, err := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Services\AmazonSSMAgent`, registry.QUERY_VALUE)
+	if err != nil {
+		log.Warnf("Error opening registry key: %v", err)
+		return ""
+	}
+	defer key.Close()
+	version, _, err := key.GetStringValue("Version")
+	if err != nil {
+		log.Warnf("Error getting Agent version value: %v", err)
+	}
+	return strings.TrimSpace(version)
 }

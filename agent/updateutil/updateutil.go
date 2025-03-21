@@ -45,12 +45,23 @@ import (
 	"github.com/aws/amazon-ssm-agent/core/workerprovider/longrunningprovider/model"
 )
 
+type CommandExecutionSettings struct {
+	Log         log.T
+	Cmd         []string
+	WorkingDir  string
+	UpdaterRoot string
+	StdOut      string
+	StdErr      string
+	IsAsync     bool
+	Env         []string
+}
+
 // T represents the interface for Update utility
 type T interface {
 	CreateUpdateDownloadFolder() (folder string, err error)
-	ExeCommand(log log.T, cmd string, workingDir string, updaterRoot string, stdOut string, stdErr string, isAsync bool) (pid int, exitCode updateconstants.UpdateScriptExitCode, err error)
-	ExeCommandWithSlice(log log.T, cmd []string, workingDir string, updaterRoot string, stdOut string, stdErr string, isAsync bool) (pid int, exitCode updateconstants.UpdateScriptExitCode, err error)
-	ExecCommandWithOutput(log log.T, cmd string, workingDir string, updaterRoot string, stdOut string, stdErr string) (pId int, updExitCode updateconstants.UpdateScriptExitCode, stdoutBytes *bytes.Buffer, errorBytes *bytes.Buffer, cmdErr error)
+	ExeCommand(input *CommandExecutionSettings) (pid int, exitCode updateconstants.UpdateScriptExitCode, err error)
+	ExeCommandWithSlice(input *CommandExecutionSettings) (pid int, exitCode updateconstants.UpdateScriptExitCode, err error)
+	ExecCommandWithOutput(input *CommandExecutionSettings) (pId int, updExitCode updateconstants.UpdateScriptExitCode, stdoutBytes *bytes.Buffer, errorBytes *bytes.Buffer, cmdErr error)
 	IsServiceRunning(log log.T, i updateinfo.T) (result bool, err error)
 	IsWorkerRunning(log log.T) (result bool, err error)
 	WaitForServiceToStart(log log.T, i updateinfo.T, targetVersion string) (result bool, err error)
@@ -58,6 +69,7 @@ type T interface {
 	IsDiskSpaceSufficientForUpdate(log log.T) (bool, error)
 	UpdateInstallDelayer(ctx context.T, updateRoot string) error
 	LoadUpdateDocumentState(ctx context.T, commandId string) error
+	VerifyInstalledVersion(log log.T, targetVersion string) updateconstants.ErrorCode
 	UpdateExecutionTimeOut(int)
 	GetExecutionTimeOut() int
 }
@@ -119,23 +131,24 @@ func (util *Utility) GetExecutionTimeOut() int {
 }
 
 // ExecCommandWithOutput executes shell command and returns output and error of command execution
-func (util *Utility) ExecCommandWithOutput(
-	log log.T,
-	cmd string,
-	workingDir string,
-	outputRoot string,
-	stdOut string,
-	stdErr string) (pId int, updExitCode updateconstants.UpdateScriptExitCode, stdoutBytes *bytes.Buffer, errorBytes *bytes.Buffer, cmdErr error) {
-
-	parts := strings.Fields(cmd)
+func (util *Utility) ExecCommandWithOutput(input *CommandExecutionSettings) (pId int, updExitCode updateconstants.UpdateScriptExitCode, stdoutBytes *bytes.Buffer, errorBytes *bytes.Buffer, cmdErr error) {
+	log := input.Log
+	parts := input.Cmd
 	pid := -1
 	var updateExitCode updateconstants.UpdateScriptExitCode = -1
 	tempCmd := setPlatformSpecificCommand(parts)
 	command := execCommand(tempCmd[0], tempCmd[1:]...)
-	command.Dir = workingDir
-	stdoutWriter, stderrWriter, err := setExeOutErr(outputRoot, stdOut, stdErr)
+	command.Dir = input.WorkingDir
+
+	// Update command env if set by the caller
+	// If not set, command passes the os.Environ() by default
+	if input.Env != nil && len(input.Env) > 0 {
+		command.Env = input.Env
+	}
+
+	stdoutWriter, stderrWriter, err := setExeOutErr(input.UpdaterRoot, input.StdOut, input.StdErr)
 	if err != nil {
-		return pid, updateExitCode, nil, nil, err
+		return pid, updateconstants.ExitCodeErrorPrepareUpdateCommand, nil, nil, err
 	}
 	defer stdoutWriter.Close()
 	defer stderrWriter.Close()
@@ -145,7 +158,7 @@ func (util *Utility) ExecCommandWithOutput(
 
 	err = cmdStart(command)
 	if err != nil {
-		return pid, updateExitCode, &stdOutBytes, &errBytes, err
+		return pid, updateconstants.ExitCodeErrorPrepareUpdateCommand, &stdOutBytes, &errBytes, err
 	}
 
 	pid = GetCommandPid(command)
@@ -185,50 +198,40 @@ func (util *Utility) ExecCommandWithOutput(
 }
 
 // ExeCommand executes shell command
-func (util *Utility) ExeCommand(
-	log log.T,
-	cmd string,
-	workingDir string,
-	outputRoot string,
-	stdOut string,
-	stdErr string,
-	isAsync bool) (int, updateconstants.UpdateScriptExitCode, error) { // pid, exitCode, error
-
-	parts := strings.Fields(cmd)
-	return util.ExeCommandWithSlice(log, parts, workingDir, outputRoot, stdOut, stdErr, isAsync)
+func (util *Utility) ExeCommand(input *CommandExecutionSettings) (int, updateconstants.UpdateScriptExitCode, error) { // pid, exitCode, error
+	return util.ExeCommandWithSlice(input)
 }
 
-// ExeCommand executes shell command
-func (util *Utility) ExeCommandWithSlice(
-	log log.T,
-	cmd []string,
-	workingDir string,
-	outputRoot string,
-	stdOut string,
-	stdErr string,
-	isAsync bool) (int, updateconstants.UpdateScriptExitCode, error) { // pid, exitCode, error
-
+// ExeCommandWithSlice executes shell command
+func (util *Utility) ExeCommandWithSlice(input *CommandExecutionSettings) (int, updateconstants.UpdateScriptExitCode, error) { // pid, exitCode, error
+	log := input.Log
 	pid := -1
 	var updateExitCode updateconstants.UpdateScriptExitCode = -1
-
-	if isAsync {
+	cmd := input.Cmd
+	if input.IsAsync {
 		command := execCommand(cmd[0], cmd[1:]...)
-		command.Dir = workingDir
-		util.setCommandEnvironmentVariables(command)
+		command.Dir = input.WorkingDir
+		util.setCommandEnvironmentVariables(command, input.Env)
 		prepareProcess(command)
 		// Start command asynchronously
 		err := cmdStart(command)
 		if err != nil {
-			return pid, updateExitCode, err
+			return pid, updateconstants.ExitCodeErrorPrepareUpdateCommand, err
 		}
 		pid = GetCommandPid(command)
 	} else {
 		tempCmd := setPlatformSpecificCommand(cmd)
 		command := execCommand(tempCmd[0], tempCmd[1:]...)
-		command.Dir = workingDir
-		stdoutWriter, stderrWriter, err := setExeOutErr(outputRoot, stdOut, stdErr)
+		command.Dir = input.WorkingDir
+
+		// Update command env if set by the caller
+		// If not set, command passes the os.Environ() by default
+		if input.Env != nil && len(input.Env) > 0 {
+			command.Env = input.Env
+		}
+		stdoutWriter, stderrWriter, err := setExeOutErr(input.UpdaterRoot, input.StdOut, input.StdErr)
 		if err != nil {
-			return pid, updateExitCode, err
+			return pid, updateconstants.ExitCodeErrorPrepareUpdateCommand, err
 		}
 		defer stdoutWriter.Close()
 		defer stderrWriter.Close()
@@ -238,7 +241,7 @@ func (util *Utility) ExeCommandWithSlice(
 
 		err = cmdStart(command)
 		if err != nil {
-			return pid, updateExitCode, err
+			return pid, updateconstants.ExitCodeErrorPrepareUpdateCommand, err
 		}
 
 		pid = GetCommandPid(command)
@@ -295,7 +298,7 @@ func (util *Utility) ExeCommandOutput(
 
 	command := execCommand(tempCmd[0], tempCmd[1:]...)
 	command.Dir = workingDir
-	util.setCommandEnvironmentVariables(command)
+	util.setCommandEnvironmentVariables(command, nil)
 	stdoutWriter, stderrWriter, exeErr := setExeOutErr(outputRoot, stdOutFileName, stdErrFileName)
 	if exeErr != nil {
 		return output, exeErr
@@ -341,7 +344,7 @@ func (util *Utility) NewExeCommandOutput(
 
 	command := execCommand(tempCmd[0], tempCmd[1:]...)
 	command.Dir = workingDir
-	util.setCommandEnvironmentVariables(command)
+	util.setCommandEnvironmentVariables(command, nil)
 	// Don't set command.Stdout - we're going to return it instead of writing it
 	command.Stderr = stderrWriter
 
@@ -450,6 +453,12 @@ func (util *Utility) IsWorkerRunning(log log.T) (result bool, err error) {
 	}
 
 	return false, nil
+}
+
+// VerifyInstalledVersion verifies whether the expected version is installed on Windows instance.
+// For linux, this function always return true
+func (util *Utility) VerifyInstalledVersion(log log.T, targetVersion string) updateconstants.ErrorCode {
+	return verifyVersion(log, targetVersion)
 }
 
 // WaitForServiceToStart wait for service to start and returns is service started
@@ -818,7 +827,7 @@ func IsIdentityRuntimeConfigSupported(sourceVersion string) bool {
 	return err == nil && comp > 0
 }
 
-func (util *Utility) setCommandEnvironmentVariables(command *exec.Cmd) {
+func (util *Utility) setCommandEnvironmentVariables(command *exec.Cmd, commandEnv []string) {
 	credentialProvider, ok := getRemoteProvider(util.Context.Identity())
 	if !ok {
 		return
@@ -829,7 +838,16 @@ func (util *Utility) setCommandEnvironmentVariables(command *exec.Cmd) {
 		return
 	}
 
-	osEnv := os.Environ()
+	var osEnv []string
+	// set environment variables
+	if commandEnv != nil && len(commandEnv) > 0 {
+		// Update command env if set by the caller
+		// If not set, command passes the os.Environ() by default
+		osEnv = commandEnv
+	} else {
+		osEnv = os.Environ()
+	}
+
 	command.Env = osEnv
 	if _, ok := os.LookupEnv("AWS_SHARED_CREDENTIALS_FILE"); !ok && credentialProvider.ShareFile() != "" {
 		command.Env = append(command.Env, fmt.Sprintf("%s=%s", "AWS_SHARED_CREDENTIALS_FILE", credentialProvider.ShareFile()))

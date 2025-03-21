@@ -20,6 +20,7 @@ package xendetector
 import (
 	"strings"
 
+	"github.com/aws/amazon-ssm-agent/agent/log"
 	"github.com/aws/amazon-ssm-agent/common/identity/availableidentities/ec2/ec2detector/helper"
 )
 
@@ -29,41 +30,25 @@ const (
 )
 
 type xenDetector struct {
-	helper  helper.DetectorHelper
-	version string
-	uuid    string
+	uuidParamKey    string
+	versionParamKey string
 }
 
-func (d *xenDetector) getUuid() string {
-	if d.uuid != "" {
-		return d.uuid
-	}
-
-	d.uuid = d.helper.GetSystemInfo(xenUuidSystemInfoParam)
-	return d.uuid
-}
-
-func (d *xenDetector) getVersion() string {
-	if d.version != "" {
-		return d.version
-	}
-
-	d.version = d.helper.GetSystemInfo(xenVersionSystemInfoParam)
-	return d.version
-}
-
-func (d *xenDetector) IsEc2() bool {
-	if !strings.HasSuffix(strings.ToLower(d.getVersion()), expectedVersionSuffix) {
+func (d *xenDetector) IsEc2(log log.T) bool {
+	if !strings.HasSuffix(strings.ToLower(helper.GetSystemInfo(log, d.versionParamKey)), expectedVersionSuffix) {
 		return false
 	}
 
-	return d.helper.MatchUuid(d.getUuid())
+	return helper.MatchUuid(log, d.uuidParamKey)
 }
 
 func (d *xenDetector) GetName() string {
 	return Name
 }
 
-func New(helper helper.DetectorHelper) *xenDetector {
-	return &xenDetector{helper: helper}
+func New(uuidParamKey, versionParamKey string) *xenDetector {
+	return &xenDetector{
+		uuidParamKey:    uuidParamKey,
+		versionParamKey: versionParamKey,
+	}
 }

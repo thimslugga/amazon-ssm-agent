@@ -22,13 +22,13 @@ checkstyle::
 
 analyze-install::
 	$(GO_SPACE)/Tools/src/static_analysis.sh $(shell echo ${flags} | tr ",\[\]" " \"") -I
-  		  
+
 analyze::
 #	Runs analysis script located inside Tools/src
 #	Please install gosec and govulncheck using `make analyze-install`
 #	script flags can be passed into make file by converting space -> , and "" -> []
-	$(GO_SPACE)/Tools/src/static_analysis.sh -d $(shell echo ${flags} | tr ",\[\]" " \"")  
-  		  
+	$(GO_SPACE)/Tools/src/static_analysis.sh -d $(shell echo ${flags} | tr ",\[\]" " \"")
+
 coverage:: build-linux
 	$(GO_SPACE)/Tools/src/coverage.sh \
 	  github.com/aws/amazon-ssm-agent/agent/... \
@@ -477,3 +477,17 @@ build-tests-windows: copy-src copy-tests-src pre-build
 lint:
 # if you want to configure what linters are run, edit .golangci.yml
 	$(GO_SPACE)/Tools/src/run_golangci-lint.sh
+
+# simple version of analyze target
+.PHONY: security-check
+security-check:
+	gosec -quiet -severity high -confidence high $(GO_SPACE)/agent/... $(GO_SPACE)/core/... $(GO_SPACE)/common/... $(GO_SPACE)/internal/...
+
+.PHONY: vuln-check
+vuln-check:
+	govulncheck $(GO_SPACE)/agent/... $(GO_SPACE)/core/... $(GO_SPACE)/common/... $(GO_SPACE)/internal/...
+
+# Static analyses using argot
+.PHONY: argot-check
+argot-check:
+	$(GO_SPACE)/Tools/src/run_argot.sh

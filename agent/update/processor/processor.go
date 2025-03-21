@@ -21,9 +21,12 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aws/amazon-ssm-agent/common/utility"
 
 	"github.com/aws/amazon-ssm-agent/agent/appconfig"
 	"github.com/aws/amazon-ssm-agent/agent/context"
@@ -31,6 +34,7 @@ import (
 	"github.com/aws/amazon-ssm-agent/agent/fileutil"
 	"github.com/aws/amazon-ssm-agent/agent/fileutil/artifact"
 	"github.com/aws/amazon-ssm-agent/agent/log"
+	"github.com/aws/amazon-ssm-agent/agent/platform"
 	testerPkg "github.com/aws/amazon-ssm-agent/agent/update/tester"
 	"github.com/aws/amazon-ssm-agent/agent/updateutil"
 	"github.com/aws/amazon-ssm-agent/agent/updateutil/updateconstants"
@@ -45,12 +49,16 @@ var minimumSupportedVersions map[string]string
 var once sync.Once
 
 var (
-	downloadArtifact       = artifact.Download
-	uncompress             = fileutil.Uncompress
-	getInstalledVersionRef = getInstalledVersions
-	getDirectoryNames      = fileutil.GetDirectoryNames
-	deleteDirectory        = os.RemoveAll
-	getStableManifestURL   = updateutil.GetStableURLFromManifestURL
+	downloadArtifact           = artifact.Download
+	uncompress                 = fileutil.Uncompress
+	getInstalledVersionRef     = getInstalledVersions
+	getDirectoryNames          = fileutil.GetDirectoryNames
+	deleteDirectory            = os.RemoveAll
+	getStableManifestURL       = updateutil.GetStableURLFromManifestURL
+	getFileNamesLaterThan      = fileutil.GetFileNamesUnsortedLaterThan
+	moveFile                   = fileutil.MoveFile
+	waitForCloudInit           = utility.WaitForCloudInit
+	isWindowsServer2025OrLater = platform.IsWindowsServer2025OrLater
 )
 
 const (
@@ -58,6 +66,9 @@ const (
 	defaultStderrFileName      = "stderr"
 	defaultSSMAgentName        = "amazon-ssm-agent"
 	defaultSelfUpdateMessageID = "aws.ssm.self-update-agent.i-instanceid"
+	installationDirectory      = "installationDir"
+	cloudInitWaitSeconds       = 600
+	agentVersionPriorWin2025   = "3.3.1230.0"
 )
 
 // NewUpdater creates an instance of Updater and other services it requires
@@ -90,6 +101,7 @@ func NewUpdater(context context.T, info updateinfo.T, updateUtilRef *updateutil.
 			clean:               cleanAgentArtifacts,
 			runTests:            testerPkg.StartTests,
 			finalize:            finalizeUpdateAndSendReply,
+			reportMetric:        reportIntermediateMetric,
 		},
 	}
 
@@ -155,18 +167,28 @@ func (u *Updater) Failed(updateDetail *UpdateDetail, log log.T, code updateconst
 
 // validateUpdateVersion validates target version number base on the current platform
 // to avoid accidentally downgrade agent to the earlier version that doesn't support current platform
-func validateUpdateVersion(log log.T, detail *UpdateDetail, info updateinfo.T) (err error) {
-	compareResult := 0
+func validateUpdateVersion(log log.T, detail *UpdateDetail, info updateinfo.T) error {
 	minimumVersions := getMinimumVSupportedVersions()
 
 	// check if current platform has minimum supported version
 	if val, ok := (*minimumVersions)[info.GetPlatform()]; ok {
 		// compare current agent version with minimum supported version
-		if compareResult, err = versionutil.VersionCompare(detail.TargetVersion, val); err != nil {
+		if compareResult, err := versionutil.VersionCompare(detail.TargetVersion, val); err != nil {
 			return err
-		}
-		if compareResult < 0 {
+		} else if compareResult < 0 {
 			return fmt.Errorf("agent version %v is unsupported on current platform", detail.TargetVersion)
+		}
+	}
+
+	if windows2025OrLater, err := isWindowsServer2025OrLater(info.GetPlatformVersion(), log); err != nil {
+		return err
+	} else if windows2025OrLater {
+		// target agent version has to be greater than the lastest agent version that didn't have support for Win 2025,
+		// in order to work with it or with any other Win released after
+		if compareResult, err := versionutil.VersionCompare(detail.TargetVersion, agentVersionPriorWin2025); err != nil {
+			return err
+		} else if compareResult <= 0 {
+			return fmt.Errorf("agent version %s is unsupported on current platform", detail.TargetVersion)
 		}
 	}
 
@@ -349,10 +371,7 @@ func validateUpdateParam(mgr *updateManager, logger log.T, updateDetail *UpdateD
 		updateDetail.RequiresUninstall = true
 		logger.Infof("Source version is higher than target version, will require a downgrade")
 
-		// TODO: if updateDetail.TargetResolver != updateconstants.TargetVersionCustomerDefined { override allowDowngrade
-		//        - If latest active version is < current version, current version has been deprecated and there is no newer version
-
-		if !updateDetail.AllowDowngrade {
+		if !updateDetail.AllowDowngrade && !allowDowngradeForVersionNotActive(mgr, logger, updateDetail) {
 			logger.Warnf("Downgrade is not enabled, please enable downgrade to perform this update")
 			return mgr.failed(updateDetail, logger, updateconstants.ErrorAttemptToDowngrade, fmt.Sprintf("Updating %v to an older version %v, please enable allow downgrade to proceed", updateDetail.SourceVersion, updateDetail.TargetVersion), true)
 		}
@@ -391,6 +410,22 @@ func validateUpdateParam(mgr *updateManager, logger log.T, updateDetail *UpdateD
 	}
 
 	return mgr.populateUrlHash(mgr, logger, updateDetail)
+}
+
+// Allow rollback if current version installed is not active
+// And that customer are not manually specifying a version.
+func allowDowngradeForVersionNotActive(mgr *updateManager, logger log.T, updateDetail *UpdateDetail) (allowed bool) {
+	isSourceVersionActive, err := updateDetail.Manifest.IsVersionActive(appconfig.DefaultAgentName, updateDetail.SourceVersion)
+	if err != nil {
+		// If we cannot read manifest, err on the safe side and do not change behavior
+		logger.Errorf("Unable to read manifest file to verify active version: ", err)
+		return
+	}
+	if updateDetail.TargetResolver != updateconstants.TargetVersionCustomerDefined && !isSourceVersionActive {
+		logger.Infof("Current version %s is not active, allow downgrade", updateDetail.SourceVersion)
+		allowed = true
+	}
+	return
 }
 
 // populateUrlHash continues initializing after self update has been handled
@@ -463,8 +498,12 @@ func downloadPackages(mgr *updateManager, log log.T, updateDetail *UpdateDetail)
 
 // proceedUpdate starts update process
 func proceedUpdate(mgr *updateManager, log log.T, updateDetail *UpdateDetail) (err error) {
+	if err := waitForCloudInit(log, cloudInitWaitSeconds); err != nil {
+		log.Warnf("error waiting for cloud-init: %v", err)
+	}
+
 	log.Infof(
-		"Attemping to upgrade from %v to %v",
+		"Attempting to upgrade from %v to %v",
 		updateDetail.SourceVersion,
 		updateDetail.TargetVersion)
 
@@ -477,10 +516,23 @@ func proceedUpdate(mgr *updateManager, log log.T, updateDetail *UpdateDetail) (e
 				updateDetail.PackageName,
 				updateDetail.SourceVersion)
 			mgr.subStatus = updateconstants.Downgrade
+
+			// Command never executes, no need to rollback
+			if exitCode == updateconstants.ExitCodeErrorPrepareUpdateCommand {
+				errorCode := updateconstants.ErrorUninstallFailed + updateconstants.ErrorCode(updateconstants.ErrorPrepareUpdateCommandSuffix)
+				return mgr.failed(updateDetail, log, errorCode, message, true)
+			}
+
 			if exitCode == updateconstants.ExitCodeUnsupportedPlatform {
 				return mgr.failed(updateDetail, log, updateconstants.ErrorUnsupportedServiceManager, message, true)
 			}
-			return mgr.failed(updateDetail, log, updateconstants.ErrorUninstallFailed, message, true)
+
+			if slices.Contains(updateconstants.ExitCodesUpdateErrorUsingPkgMgr, exitCode) {
+				updateDetail.AppendError(log, message)
+				mgr.reportMetric(mgr, updateDetail, insertPkgMgrErrorCode(updateconstants.ErrorUninstallFailed, exitCode))
+			} else {
+				return mgr.failed(updateDetail, log, updateconstants.ErrorUninstallFailed, message, true)
+			}
 		}
 	}
 
@@ -499,12 +551,28 @@ func proceedUpdate(mgr *updateManager, log log.T, updateDetail *UpdateDetail) (e
 			updateDetail.TargetVersion)
 		updateDetail.AppendError(log, message)
 
+		// Command never executes, no need to rollback
+		if exitCode == updateconstants.ExitCodeErrorPrepareUpdateCommand {
+			errorCode := updateconstants.ErrorInstallFailed + updateconstants.ErrorCode(updateconstants.ErrorPrepareUpdateCommandSuffix)
+			return mgr.failed(updateDetail, log, errorCode, message, true)
+		}
+
 		if exitCode == updateconstants.ExitCodeUnsupportedPlatform {
 			return mgr.failed(updateDetail, log, updateconstants.ErrorUnsupportedServiceManager, message, true)
 		}
+
 		if exitCode == updateconstants.ExitCodeUpdateFailedDueToSnapd {
 			return mgr.failed(updateDetail, log, updateconstants.ErrorInstallFailureDueToSnapd, message, true)
 		}
+
+		if exitCode == updateconstants.ExitCodeInstallFailedDueToSigningIssue {
+			mgr.reportMetric(mgr, updateDetail, updateconstants.ErrorInstallFailedDueToSigningIssue)
+		}
+
+		if slices.Contains(updateconstants.ExitCodesUpdateErrorUsingPkgMgr, exitCode) {
+			mgr.reportMetric(mgr, updateDetail, insertPkgMgrErrorCode(updateconstants.ErrorInstallFailed, exitCode))
+		}
+
 		updateDetail.AppendInfo(
 			log,
 			"Initiating rollback %v to %v",
@@ -535,7 +603,7 @@ func verifyInstallation(mgr *updateManager, log log.T, updateDetail *UpdateDetai
 	if isRollback {
 		version = updateDetail.SourceVersion
 	}
-	log.Infof("Initiating update health check")
+	log.Info("Initiating Agent service check")
 	if isRunning, err = mgr.util.WaitForServiceToStart(log, mgr.Info, version); err != nil || !isRunning {
 		if !isRollback {
 			message := updateutil.BuildMessage(err,
@@ -567,8 +635,17 @@ func verifyInstallation(mgr *updateManager, log log.T, updateDetail *UpdateDetai
 		return mgr.failed(updateDetail, log, updateconstants.ErrorCannotStartService, message, false)
 	}
 
-	log.Infof("%v is running", updateDetail.PackageName)
 	if !isRollback {
+		// initiate rollback when agent installation is not complete
+		if versionInstalledErrCode := mgr.util.VerifyInstalledVersion(log, version); versionInstalledErrCode != "" {
+			message := updateutil.BuildMessage(nil,
+				"failed to identify installed target agent version: %v",
+				updateDetail.TargetVersion)
+			updateDetail.AppendError(log, message)
+			// we will receive only 1 error code - ErrorInstTargetVersionNotFoundViaReg
+			return mgr.failed(updateDetail, log, versionInstalledErrCode, message, false)
+		}
+		log.Infof("%v is running", updateDetail.PackageName)
 		return mgr.succeeded(updateDetail, log)
 	}
 
@@ -587,12 +664,23 @@ func rollbackInstallation(mgr *updateManager, log log.T, updateDetail *UpdateDet
 			updateDetail.PackageName,
 			updateDetail.TargetVersion)
 
+		if exitCode == updateconstants.ExitCodeErrorPrepareUpdateCommand {
+			errorCode := updateconstants.ErrorUninstallFailed + updateconstants.ErrorCode(updateconstants.ErrorPrepareUpdateCommandSuffix)
+			return mgr.failed(updateDetail, log, errorCode, message, false)
+		}
+
 		// this case is not possible at all as we would have caught it in the earlier uninstall/install
 		// if this happens, something else is wrong so it is better to have this code for differentiation
 		if exitCode == updateconstants.ExitCodeUnsupportedPlatform {
-			return mgr.failed(updateDetail, log, updateconstants.ErrorUnsupportedServiceManager, message, true)
+			return mgr.failed(updateDetail, log, updateconstants.ErrorUnsupportedServiceManager, message, false)
 		}
-		return mgr.failed(updateDetail, log, updateconstants.ErrorUninstallFailed, message, false)
+
+		if slices.Contains(updateconstants.ExitCodesUpdateErrorUsingPkgMgr, exitCode) {
+			updateDetail.AppendError(log, message)
+			mgr.reportMetric(mgr, updateDetail, insertPkgMgrErrorCode(updateconstants.ErrorUninstallFailed, exitCode))
+		} else {
+			return mgr.failed(updateDetail, log, updateconstants.ErrorUninstallFailed, message, false)
+		}
 	}
 
 	if exitCode, err := mgr.install(mgr, log, updateDetail.SourceVersion, updateDetail); err != nil {
@@ -603,12 +691,22 @@ func rollbackInstallation(mgr *updateManager, log log.T, updateDetail *UpdateDet
 			updateDetail.PackageName,
 			updateDetail.SourceVersion)
 
+		if exitCode == updateconstants.ExitCodeErrorPrepareUpdateCommand {
+			errorCode := updateconstants.ErrorInstallFailed + updateconstants.ErrorCode(updateconstants.ErrorPrepareUpdateCommandSuffix)
+			return mgr.failed(updateDetail, log, errorCode, message, false)
+		}
+
 		// this case is not possible at all as we would have caught it in the earlier uninstall/install
 		// if this happens, something else is wrong and it is better to have this code for differentiation
 		if exitCode == updateconstants.ExitCodeUnsupportedPlatform {
-			return mgr.failed(updateDetail, log, updateconstants.ErrorUnsupportedServiceManager, message, true)
+			return mgr.failed(updateDetail, log, updateconstants.ErrorUnsupportedServiceManager, message, false)
 		}
-		return mgr.failed(updateDetail, log, updateconstants.ErrorInstallFailed, message, false)
+
+		if exitCode == updateconstants.ExitCodeInstallFailedDueToSigningIssue {
+			return mgr.failed(updateDetail, log, updateconstants.ErrorInstallFailedDueToSigningIssue, message, false)
+		}
+
+		return mgr.failed(updateDetail, log, insertPkgMgrErrorCode(updateconstants.ErrorInstallFailed, exitCode), message, false)
 	}
 
 	if err = mgr.inProgress(updateDetail, log, RolledBack); err != nil {
@@ -637,16 +735,19 @@ func uninstallAgent(mgr *updateManager, log log.T, version string, updateDetail 
 	uninstallRetryCount := 3
 	uninstallRetryDelay := 1000     // 1 second
 	uninstallRetryDelayBase := 2000 // 2 seconds
+	input := &updateutil.CommandExecutionSettings{
+		Log:         log,
+		Cmd:         strings.Fields(uninstallPath),
+		WorkingDir:  workDir,
+		UpdaterRoot: updateDetail.UpdateRoot,
+		StdOut:      updateDetail.StdoutFileName,
+		StdErr:      updateDetail.StderrFileName,
+		IsAsync:     false,
+		Env:         getCommandEnv(log, updateDetail.UpdateRoot),
+	}
 	// Uninstall version - TODO - move the retry logic to ExeCommand while cleaning that function
 	for retryCounter := 1; retryCounter <= uninstallRetryCount; retryCounter++ {
-		_, exitCode, err = mgr.util.ExeCommand(
-			log,
-			uninstallPath,
-			workDir,
-			updateDetail.UpdateRoot,
-			updateDetail.StdoutFileName,
-			updateDetail.StderrFileName,
-			false)
+		_, exitCode, err = mgr.util.ExeCommand(input)
 		if err == nil {
 			break
 		}
@@ -684,33 +785,39 @@ func installAgent(mgr *updateManager, log log.T, version string, updateDetail *U
 	}
 	defaultTimeOut := mgr.util.GetExecutionTimeOut()
 
+	input := &updateutil.CommandExecutionSettings{
+		Log:         log,
+		Cmd:         strings.Fields(installerPath),
+		WorkingDir:  workDir,
+		UpdaterRoot: updateDetail.UpdateRoot,
+		StdOut:      updateDetail.StdoutFileName,
+		StdErr:      updateDetail.StderrFileName,
+		IsAsync:     false,
+		Env:         getCommandEnv(log, updateDetail.UpdateRoot),
+	}
 	for retryCounter := 1; retryCounter <= installRetryCount; retryCounter++ {
 		updateExecutionTimeoutIfNeeded(retryCounter, defaultTimeOut, mgr.util)
-		if retryCounter == installRetryCount && strings.Contains(mgr.Info.GetInstallScriptName(), "snap") {
-			log.Info("execute command and fetch error output for agent install using snap")
-			var errBytes *bytes.Buffer
-			_, exitCode, _, errBytes, err = mgr.util.ExecCommandWithOutput(
-				log,
-				installerPath,
-				workDir,
-				updateDetail.UpdateRoot,
-				updateDetail.StdoutFileName,
-				updateDetail.StderrFileName)
-			if err != nil && errBytes != nil && errBytes.Len() != 0 {
-				if strings.Contains(errBytes.String(), "snap \"amazon-ssm-agent\" has running apps") {
-					log.Errorf("command failure for agent installed using snap: %v", err)
-					return updateconstants.ExitCodeUpdateFailedDueToSnapd, err
+		if retryCounter == installRetryCount {
+			log.Info("execute command and fetch error output for agent install")
+			var outBytes, errBytes *bytes.Buffer
+			_, exitCode, outBytes, errBytes, err = mgr.util.ExecCommandWithOutput(input)
+
+			if strings.Contains(mgr.Info.GetInstallScriptName(), "snap") {
+				if err != nil && errBytes != nil && errBytes.Len() != 0 {
+					if strings.Contains(errBytes.String(), "snap \"amazon-ssm-agent\" has running apps") {
+						log.Errorf("command failure for agent installed using snap: %v", err)
+						return updateconstants.ExitCodeUpdateFailedDueToSnapd, err
+					}
 				}
 			}
+
+			if outBytes != nil && outBytes.Len() != 0 && strings.Contains(outBytes.String(), "does not verify: no digest") {
+				log.Errorf("command failure for agent installed with no header: %v", err)
+				return updateconstants.ExitCodeInstallFailedDueToSigningIssue, err
+			}
+
 		} else {
-			_, exitCode, err = mgr.util.ExeCommand(
-				log,
-				installerPath,
-				workDir,
-				updateDetail.UpdateRoot,
-				updateDetail.StdoutFileName,
-				updateDetail.StderrFileName,
-				false)
+			_, exitCode, err = mgr.util.ExeCommand(input)
 		}
 		if err == nil {
 			break
@@ -719,7 +826,7 @@ func installAgent(mgr *updateManager, log log.T, version string, updateDetail *U
 			backOff := getNextBackOff(retryCounter)
 
 			// Increase backoff by 30 seconds if package manager fails
-			if exitCode == updateconstants.ExitCodeUpdateUsingPkgMgr {
+			if slices.Contains(updateconstants.ExitCodesUpdateErrorUsingPkgMgr, exitCode) {
 				backOff += time.Duration(30) * time.Second // 30 seconds
 			}
 
@@ -767,6 +874,7 @@ func getInstalledVersions(updateDetail *UpdateDetail, path string) string {
 
 // cleanAgentArtifacts deletes leftover files from update folders (amazon-ssm-agent, amazon-ssm-agent-updater and downloads folder)
 func cleanAgentArtifacts(log log.T, updateDetail *UpdateDetail) {
+	moveCleanInstallationDir(log, updateDetail)
 	_ = cleanAgentUpdaterDir(log, updateDetail)
 	cleanUpdateDownloadDir(log)
 }
@@ -856,4 +964,21 @@ func downloadAndUnzipArtifact(
 	}
 
 	return nil
+}
+
+// insertPkgMgrErrorCode inserts package manager error code suffix when applies
+func insertPkgMgrErrorCode(errorCode updateconstants.ErrorCode, exitCode updateconstants.UpdateScriptExitCode) (result updateconstants.ErrorCode) {
+	switch exitCode {
+	default:
+		result = errorCode
+	case updateconstants.ExitCodeUpdateErrorUsingYumAndRpm:
+		result = errorCode + updateconstants.ErrorCode(updateconstants.ErrorUsingYumAndRpmSuffix)
+	case updateconstants.ExitCodeUpdateErrorUsingDpkg:
+		result = errorCode + updateconstants.ErrorCode(updateconstants.ErrorUsingDpkgSuffix)
+	case updateconstants.ExitCodeUpdateErrorUsingSnap:
+		result = errorCode + updateconstants.ErrorCode(updateconstants.ErrorUsingSnapSuffix)
+	case updateconstants.ExitCodeUpdateErrorUsingPkgMgrLegacy:
+		result = errorCode + updateconstants.ErrorCode(updateconstants.ErrorUsingPkgMgrLegacySuffix)
+	}
+	return
 }

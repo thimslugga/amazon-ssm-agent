@@ -39,13 +39,13 @@ func Config(reload bool) (SsmagentConfig, error) {
 	if reload || !isLoaded() {
 		var agentConfig SsmagentConfig
 		agentConfig = DefaultConfig()
+		agentConfig.Os.Name = runtime.GOOS
+		agentConfig.Agent.Version = version.Version
+
 		path, pathErr := retrieveAppConfigPath()
 		if pathErr != nil {
 			return agentConfig, nil
 		}
-		agentConfig.Os.Name = runtime.GOOS
-		agentConfig.Agent.Version = version.Version
-
 		// Process config override
 		fmt.Printf("Applying config override from %s.\n", path)
 
@@ -116,6 +116,7 @@ func DefaultConfig() SsmagentConfig {
 		AssociationLogsRetentionDurationHours: DefaultAssociationLogsRetentionDurationHours,
 		RunCommandLogsRetentionDurationHours:  DefaultRunCommandLogsRetentionDurationHours,
 		SessionLogsRetentionDurationHours:     DefaultSessionLogsRetentionDurationHours,
+		SessionLogsDestination:                SessionLogsDestinationNone,
 		PluginLocalOutputCleanup:              DefaultPluginOutputRetention,
 		OrchestrationDirectoryCleanup:         DefaultOrchestrationDirCleanup,
 	}
@@ -143,7 +144,9 @@ func DefaultConfig() SsmagentConfig {
 		CustomIdentities: []*CustomIdentity{},
 	}
 	var birdwatcher BirdwatcherCfg
-	var kms KmsConfig
+	var kms = KmsConfig{
+		RequireKMSChallengeResponse: DefaultRequireKMSChallengeResponse,
+	}
 
 	var ssmagentCfg = SsmagentConfig{
 		Profile:     credsProfile,

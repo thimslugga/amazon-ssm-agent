@@ -18,6 +18,7 @@
         "AssociationLogsRetentionDurationHours" : 24,
         "RunCommandLogsRetentionDurationHours" : 336,
         "SessionLogsRetentionDurationHours" : 336,
+        "SessionLogsDestination": "none",
         "PluginLocalOutputCleanup": "",
         "OrchestrationDirectoryCleanup": ""
     },
@@ -59,6 +60,7 @@
         "LogKey":""
     },
     "Kms": {
-        "Endpoint": ""
+        "Endpoint": "",
+        "RequireKMSChallengeResponse": false
     }
 }

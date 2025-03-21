@@ -130,6 +130,34 @@ func TestSetWebSocket(t *testing.T) {
 	mockService.AssertExpectations(t)
 }
 
+func TestCancelTaskOnSessionTermination(t *testing.T) {
+	dataChannel := getDataChannel()
+
+	// Using dedicated testMockService as strechr does not have reset mock: https://github.com/stretchr/testify/issues/944
+	testMockService := &serviceMock.Service{}
+	dataChannel.Service = testMockService
+	testMockService.On("CreateDataChannel", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.New(mgsConfig.SessionAlreadyTerminatedError))
+	mockCancelFlag.On("Set", task.Canceled).Return()
+
+	onErrorHandler := dataChannel.getWsChannelOnErrorHandler(testMockService, sessionId, clientId, mockLog)
+	onErrorHandler(errors.New("Unexpected EOF"))
+
+	testMockService.AssertExpectations(t)
+	mockCancelFlag.AssertExpectations(t)
+}
+
+func TestNotCancelTaskOnOtherErrors(t *testing.T) {
+	dataChannel := getDataChannel()
+	testMockService := &serviceMock.Service{}
+	dataChannel.Service = testMockService
+	testMockService.On("CreateDataChannel", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.New("Random Error From Session"))
+	// By not having a mockCancelFlag defined, if it is invoked, this test will panic and fail.
+
+	onErrorHandler := dataChannel.getWsChannelOnErrorHandler(testMockService, sessionId, clientId, mockLog)
+	onErrorHandler(errors.New("Unexpected EOF"))
+	testMockService.AssertExpectations(t)
+}
+
 func TestOpen(t *testing.T) {
 	dataChannel := getDataChannel()
 
@@ -634,7 +662,7 @@ func TestDataChannelHandshakeResponse(t *testing.T) {
 		uint32(mgsContracts.HandshakeResponse), handshakeResponsePayload).Serialize(mockLog)
 
 	mockChannel.On("SendMessage", mock.Anything, mock.Anything, mock.Anything).Return(nil)
-	mockCipher.On("UpdateEncryptionKey", mockLog, datakey, sessionId, instanceId).Return(nil)
+	mockCipher.On("UpdateEncryptionKey", mockLog, datakey, sessionId, instanceId, mock.Anything).Return(nil)
 
 	err := dataChannel.dataChannelIncomingMessageHandler(mockLog, agentMessageBytes)
 	assert.Nil(t, err)
@@ -693,7 +721,7 @@ func TestDataChannelHandshakeResponseEncryptionAgentFailure(t *testing.T) {
 	mockChannel.On("SendMessage", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	// Throw error when processing handshake response
 	errorString := "Failed to update encryption key. Something bad happened."
-	mockCipher.On("UpdateEncryptionKey", mockLog, datakey, sessionId, instanceId).Return(errors.New(errorString))
+	mockCipher.On("UpdateEncryptionKey", mockLog, datakey, sessionId, instanceId, mock.Anything).Return(errors.New(errorString))
 
 	mockCancelFlag.On("Set", task.Canceled).Return()
 
@@ -714,6 +742,7 @@ func TestDataChannelHandshakeInitiate(t *testing.T) {
 
 	// Set up block cipher
 	mockCipher.On("GetKMSKeyId").Return(kmskey)
+	mockCipher.On("GetRandomChallenge").Return("aaaabbbbccccdddd")
 	dataChannel.blockCipher = mockCipher
 	dataChannel.encryptionEnabled = true
 

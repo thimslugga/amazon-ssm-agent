@@ -20,19 +20,12 @@ package platform
 import (
 	"fmt"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/aws/amazon-ssm-agent/agent/appconfig"
 	"github.com/aws/amazon-ssm-agent/agent/log"
+	"github.com/aws/amazon-ssm-agent/agent/versionutil"
 )
-
-const caption = "Caption"
-const version = "Version"
-const sku = "OperatingSystemSKU"
 
 // Win32_OperatingSystems https://msdn.microsoft.com/en-us/library/aa394239%28v=vs.85%29.aspx
 const (
@@ -44,10 +37,18 @@ const (
 
 	// WindowsServer2016Version represents Win32_OperatingSystemVersion https://learn.microsoft.com/en-us/windows/win32/sysinfo/operating-system-version
 	WindowsServer2016Version = 10
+
+	WindowsServer2025Version = "10.0.26100"
+
+	//BIOS param keys used for system info
+	BiosVersionParamKey      = "SMBIOSBIOSVersion"
+	BiosSerialNumberParamKey = "SerialNumber"
+	BiosManufacturerParamKey = "Manufacturer"
 )
 
 var (
-	getPlatformVersionRef = getPlatformVersion
+	getPlatformDetails = GetSingleWMIObject[Win32_OperatingSystem]
+	getSystemDetails   = GetSingleWMIObject[Win32_BIOS]
 )
 
 // isPlatformWindowsServer2012OrEarlier returns true if platform is Windows Server 2012 or earlier
@@ -56,7 +57,7 @@ func isPlatformWindowsServer2012OrEarlier(log log.T) (bool, error) {
 	var platformVersionInt int
 	var err error
 
-	if platformVersion, err = getPlatformVersionRef(log); err != nil {
+	if platformVersion, err = PlatformVersion(log); err != nil {
 		return false, err
 	}
 	versionParts := strings.Split(platformVersion, ".")
@@ -70,91 +71,85 @@ func isPlatformWindowsServer2012OrEarlier(log log.T) (bool, error) {
 	return platformVersionInt < WindowsServer2016Version, nil
 }
 
+// isPlatformWindowsServer2025OrLater returns true if current platform is Windows Server 2025 or later
+func isPlatformWindowsServer2025OrLater(log log.T) (bool, error) {
+	if platformVersion, err := PlatformVersion(log); err != nil {
+		return false, err
+	} else {
+		return isWindowsServer2025OrLater(platformVersion, log)
+	}
+}
+
+// isWindowsServer2025OrLater returns true if passed platformVersion is the same as of Windows Server 2025 or later
+func isWindowsServer2025OrLater(platformVersion string, log log.T) (bool, error) {
+	log.Debugf("Checking if platform version: %s is Windows 2025 or later...", platformVersion)
+	if result, err := versionutil.VersionCompare(platformVersion, WindowsServer2025Version); err != nil {
+		return false, err
+	} else {
+		return result >= 0, nil
+	}
+}
+
 // IsPlatformNanoServer returns true if SKU is 143 or 144
 func isPlatformNanoServer(log log.T) (bool, error) {
-	var sku string
-	var err error
-
 	// Get platform sku information
-	if sku, err = getPlatformSku(log); err != nil {
+	if sku, err := PlatformSku(log); err != nil {
 		log.Infof("Failed to fetch sku - %v", err)
 		return false, err
+	} else {
+		// Return whether sku represents nano server
+		return sku == ProductDataCenterNanoServer || sku == ProductStandardNanoServer, nil
 	}
+}
 
-	// If sku represents nano server, return true
-	if sku == ProductDataCenterNanoServer || sku == ProductStandardNanoServer {
-		return true, nil
+func getPlatformData(log log.T) (PlatformData, error) {
+	if osData, err := getPlatformDetails(""); err == nil {
+		return PlatformData{
+			Name:    osData.Caption,
+			Version: osData.Version,
+			Sku:     strconv.FormatUint(uint64(osData.OperatingSystemSKU), 10),
+			Type:    "windows",
+		}, nil
+	} else {
+		log.Errorf("Failed to fetch OS details from WMI: %v", err)
+		return PlatformData{
+			Name:    notAvailableMessage,
+			Version: notAvailableMessage,
+			Sku:     notAvailableMessage,
+			Type:    "windows",
+		}, err
 	}
-
-	return false, nil
 }
 
-func getPlatformName(log log.T) (value string, err error) {
-	return getPlatformDetails(caption, log)
-}
+func initSystemInfoCache(log log.T, paramKey string) (string, error) {
+	if biosData, err := getSystemDetails(""); err == nil {
+		cache.Put(BiosVersionParamKey, biosData.SMBIOSBIOSVersion)
+		cache.Put(BiosSerialNumberParamKey, biosData.SerialNumber)
+		cache.Put(BiosManufacturerParamKey, biosData.Manufacturer)
 
-func getPlatformType(log log.T) (value string, err error) {
-	return "windows", nil
-}
-
-func getPlatformVersion(log log.T) (value string, err error) {
-	return getPlatformDetails(version, log)
-}
-
-func getPlatformSku(log log.T) (value string, err error) {
-	return getPlatformDetails(sku, log)
-}
-
-func getPlatformDetails(property string, log log.T) (value string, err error) {
-	log.Debugf(gettingPlatformDetailsMessage)
-	value = notAvailableMessage
-
-	cmdName := "wmic"
-	cmdArgs := []string{"OS", "get", property, "/format:list"}
-	var cmdOut []byte
-	if cmdOut, err = exec.Command(cmdName, cmdArgs...).Output(); err != nil {
-		log.Debugf("There was an error running %v %v, err:%v", cmdName, cmdArgs, err)
-		return
+		var data string
+		var found bool
+		if data, found = cache.Get(paramKey); !found {
+			log.Warnf("Couldn't find mapping for the %v param key in the cache", paramKey)
+		}
+		return data, nil
+	} else {
+		log.Errorf("Failed to fetch BIOS details from WMI: %v", err)
+		return "", err
 	}
-
-	// Stringnize cmd output and trim spaces
-	value = strings.TrimSpace(string(cmdOut))
-
-	// Match whitespaces between property and = sign and remove whitespaces
-	rp := regexp.MustCompile(fmt.Sprintf("%v(\\s*)%v", property, "="))
-	value = rp.ReplaceAllString(value, "")
-
-	// Trim spaces again
-	value = strings.TrimSpace(value)
-
-	log.Debugf(commandOutputMessage, value)
-	return
 }
-
-var wmicCommand = filepath.Join(appconfig.EnvWinDir, "System32", "wbem", "wmic.exe")
 
 // fullyQualifiedDomainName returns the Fully Qualified Domain Name of the instance, otherwise the hostname
 func fullyQualifiedDomainName(log log.T) string {
-	hostName, _ := os.Hostname()
+	csData, err := GetSingleWMIObject[Win32_ComputerSystem]("")
+	if err != nil {
+		log.Errorf("Failed to fetch computer system details from WMI: %v", err)
+	}
 
-	dnsHostName := getWMICComputerSystemValue("DNSHostName")
-	domainName := getWMICComputerSystemValue("Domain")
-
-	if dnsHostName == "" || domainName == "" {
+	if csData.DNSHostName == "" || csData.Domain == "" {
+		hostName, _ := os.Hostname()
 		return hostName
 	}
 
-	return dnsHostName + "." + domainName
-}
-
-// getWMICComputerSystemValue return the value part of the wmic computersystem command for the specified attribute
-func getWMICComputerSystemValue(attribute string) string {
-	if contentBytes, err := exec.Command(wmicCommand, "computersystem", "get", attribute, "/value").Output(); err == nil {
-		contents := string(contentBytes)
-		data := strings.Split(contents, "=")
-		if len(data) > 1 {
-			return strings.TrimSpace(data[1])
-		}
-	}
-	return ""
+	return csData.DNSHostName + "." + csData.Domain
 }

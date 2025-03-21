@@ -32,6 +32,7 @@ import (
 	mgsConfig "github.com/aws/amazon-ssm-agent/agent/session/config"
 	"github.com/aws/amazon-ssm-agent/agent/session/retry"
 	"github.com/aws/amazon-ssm-agent/agent/session/service"
+	serviceMock "github.com/aws/amazon-ssm-agent/agent/session/service/mocks"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -71,17 +72,18 @@ func TestOpenDataChannel_MultiThread(suite *testing.T) {
 	u.Scheme = "ws"
 	defer srv.Close()
 
-	dataChannel := getDataChannelRef()
+	mockServiceDC := &serviceMock.Service{}
+	dataChannel := getDataChannelRef(mockServiceDC)
 	createDataChannelOutput := service.CreateDataChannelOutput{TokenValue: &token}
-	mockService.On("CreateDataChannel", mock.Anything, mock.Anything, mock.Anything).Return(&createDataChannelOutput, nil)
-	mockService.On("GetRegion").Return(region)
-	mockService.On("GetV4Signer").Return(signer)
+	mockServiceDC.On("CreateDataChannel", mock.Anything, mock.Anything, mock.Anything).Return(&createDataChannelOutput, nil)
+	mockServiceDC.On("GetRegion").Return(region)
+	mockServiceDC.On("GetV4Signer").Return(signer)
 
-	dataChannel.Initialize(mockContext, mockService, sessionId, clientId, instanceId, mgsConfig.RolePublishSubscribe, mockCancelFlag, inputStreamMessageHandler)
+	dataChannel.Initialize(mockContext, mockServiceDC, sessionId, clientId, instanceId, mgsConfig.RolePublishSubscribe, mockCancelFlag, inputStreamMessageHandler)
 	var err error
 
 	// Set local server URL
-	dataChannel.SetWebSocket(mockContext, mockService, sessionId, clientId, onMessageHandler)
+	dataChannel.SetWebSocket(mockContext, mockServiceDC, sessionId, clientId, onMessageHandler)
 	dataChannel.wsChannel.SetUrl(u.String())
 	assert.Nil(suite, err, "should not throw error during websocket creation")
 
@@ -111,16 +113,17 @@ func TestOpenDataChannel_OpenDataChannelError(suite *testing.T) {
 	u.Scheme = "ws"
 	defer srv.Close()
 
-	dataChannel := getDataChannelRef()
+	mockServiceDC := &serviceMock.Service{}
+	dataChannel := getDataChannelRef(mockServiceDC)
 	createDataChannelOutput := service.CreateDataChannelOutput{TokenValue: &token}
-	mockService.On("CreateDataChannel", mock.Anything, mock.Anything, mock.Anything).Return(&createDataChannelOutput, nil)
-	mockService.On("GetRegion").Return(region)
-	mockService.On("GetV4Signer").Return(signer)
+	mockServiceDC.On("CreateDataChannel", mock.Anything, mock.Anything, mock.Anything).Return(&createDataChannelOutput, nil)
+	mockServiceDC.On("GetRegion").Return(region)
+	mockServiceDC.On("GetV4Signer").Return(signer)
 
-	dataChannel.Initialize(mockContext, mockService, sessionId, clientId, instanceId, mgsConfig.RolePublishSubscribe, mockCancelFlag, inputStreamMessageHandler)
+	dataChannel.Initialize(mockContext, mockServiceDC, sessionId, clientId, instanceId, mgsConfig.RolePublishSubscribe, mockCancelFlag, inputStreamMessageHandler)
 	var err error
 
-	err = dataChannel.SetWebSocket(mockContext, mockService, sessionId, clientId, onMessageHandler)
+	err = dataChannel.SetWebSocket(mockContext, mockServiceDC, sessionId, clientId, onMessageHandler)
 	dataChannel.wsChannel.SetUrl(u.String())
 	assert.Nil(suite, err, "should not throw error during websocket creation")
 
@@ -137,6 +140,116 @@ func TestOpenDataChannel_OpenDataChannelError(suite *testing.T) {
 	fmt.Println(completedGRNumber)
 	// Adding buffer as tests runs parallely
 	assert.True(suite, initialGRNumber+5 >= completedGRNumber)
+}
+
+func TestDataChannel_PongWaitTimeoutReconnect(t *testing.T) {
+	httpErrorHandler := func(hw http.ResponseWriter, request *http.Request) {
+		httpConn, err := wsUpgrader.Upgrade(hw, request, nil)
+		if err != nil {
+			http.Error(hw, fmt.Sprintf("no upgrade: %v", err), http.StatusGatewayTimeout)
+			panic("Connection should be successful. Should not enter here.")
+		}
+		httpConn.SetPingHandler(func(string) error {
+			// received ping but do nothing
+			return nil
+		})
+		for {
+			_, _, err = httpConn.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	}
+
+	// launch local HTTP Server
+	srv := httptest.NewServer(http.HandlerFunc(httpErrorHandler))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	u.Scheme = "ws"
+
+	mockServiceDC := &serviceMock.Service{}
+	dataChannel := getDataChannelRef(mockServiceDC)
+	createDataChannelOutput := service.CreateDataChannelOutput{TokenValue: &token}
+	mockServiceDC.On("CreateDataChannel", mock.Anything, mock.Anything, mock.Anything).Return(&createDataChannelOutput, nil)
+	mockServiceDC.On("GetRegion").Return(region)
+	mockServiceDC.On("GetV4Signer").Return(signer)
+
+	dataChannel.Initialize(mockContext, mockServiceDC, sessionId, clientId, instanceId, mgsConfig.RolePublishSubscribe, mockCancelFlag, inputStreamMessageHandler)
+	var err error
+
+	// Set local server URL
+	dataChannel.SetWebSocket(mockContext, mockServiceDC, sessionId, clientId, onMessageHandler)
+	dataChannel.wsChannel.SetUrl(u.String())
+
+	// Get number of go-routines running
+	initialGRNumber := runtime.NumGoroutine()
+	// start the control channel Open
+	err = dataChannel.Open(mockContext.Log())
+	defer dataChannel.Close(mockLog)
+	assert.Nil(t, err, "should not throw error during channel open")
+
+	// sleep time for 4 ping pong timeout period
+	time.Sleep(4*mgsConfig.WebSocketPongWaitTimeout + 10)
+
+	mockServiceDC.AssertNumberOfCalls(t, "CreateDataChannel", 3)
+
+	completedGRNumber := runtime.NumGoroutine()
+	assert.True(t, initialGRNumber+5 >= completedGRNumber) // tests run in parallel at times hence adding some buffer
+}
+
+func TestDataChannel_PingPongKeepConnection(t *testing.T) {
+	httpErrorHandler := func(hw http.ResponseWriter, request *http.Request) {
+		httpConn, err := wsUpgrader.Upgrade(hw, request, nil)
+		if err != nil {
+			http.Error(hw, fmt.Sprintf("no upgrade: %v", err), http.StatusGatewayTimeout)
+			panic("Connection should be successful. Should not enter here.")
+		}
+		httpConn.SetPingHandler(func(string) error {
+			httpConn.WriteMessage(websocket.PongMessage, []byte(""))
+			return nil
+		})
+		for {
+			_, _, err = httpConn.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	}
+
+	// launch local HTTP Server
+	srv := httptest.NewServer(http.HandlerFunc(httpErrorHandler))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	u.Scheme = "ws"
+
+	mockServiceDC := &serviceMock.Service{}
+	dataChannel := getDataChannelRef(mockServiceDC)
+	createDataChannelOutput := service.CreateDataChannelOutput{TokenValue: &token}
+	mockServiceDC.On("CreateDataChannel", mock.Anything, mock.Anything, mock.Anything).Return(&createDataChannelOutput, nil)
+	mockServiceDC.On("GetRegion").Return(region)
+	mockServiceDC.On("GetV4Signer").Return(signer)
+
+	dataChannel.Initialize(mockContext, mockServiceDC, sessionId, clientId, instanceId, mgsConfig.RolePublishSubscribe, mockCancelFlag, inputStreamMessageHandler)
+	var err error
+
+	// Set local server URL
+	dataChannel.SetWebSocket(mockContext, mockServiceDC, sessionId, clientId, onMessageHandler)
+	dataChannel.wsChannel.SetUrl(u.String())
+
+	// Get number of go-routines running
+	initialGRNumber := runtime.NumGoroutine()
+	// start the control channel Open
+	err = dataChannel.Open(mockContext.Log())
+	defer dataChannel.Close(mockLog)
+	assert.Nil(t, err, "should not throw error during channel open")
+
+	// sleep time for 3 ping pong timeout period
+	time.Sleep(3 * mgsConfig.WebSocketPongWaitTimeout)
+
+	mockServiceDC.AssertNumberOfCalls(t, "CreateDataChannel", 1)
+
+	completedGRNumber := runtime.NumGoroutine()
+	assert.True(t, initialGRNumber+5 >= completedGRNumber) // tests run in parallel at times hence adding some buffer
 }
 
 func TestOpenDataChannel_CreateDataChannelError_RetryCount(t *testing.T) {
@@ -160,9 +273,10 @@ func TestOpenDataChannel_CreateDataChannelError_RetryCount(t *testing.T) {
 	defer srv.Close()
 
 	createDataChannelOutput := service.CreateDataChannelOutput{TokenValue: &token}
-	mockService.On("CreateDataChannel", mock.Anything, mock.Anything, mock.Anything).Return(&createDataChannelOutput, fmt.Errorf("test"))
-	mockService.On("GetRegion").Return(region)
-	mockService.On("GetV4Signer").Return(signer)
+	mockServiceDC := &serviceMock.Service{}
+	mockServiceDC.On("CreateDataChannel", mock.Anything, mock.Anything, mock.Anything).Return(&createDataChannelOutput, fmt.Errorf("test"))
+	mockServiceDC.On("GetRegion").Return(region)
+	mockServiceDC.On("GetV4Signer").Return(signer)
 
 	counter := 0
 	// Get number of go-routines running
@@ -174,12 +288,12 @@ func TestOpenDataChannel_CreateDataChannelError_RetryCount(t *testing.T) {
 	retryer := retry.ExponentialRetryer{
 		CallableFunc: func() (channel interface{}, err error) {
 			counter++
-			dataChannel := getDataChannelRef()
-			dataChannel.wsChannel.SetUrl(u.String())
-			if err := dataChannel.SetWebSocket(mockContext, mockService, sessionId, clientId, onMessageHandler); err != nil {
+			dataChannel := getDataChannelRef(mockServiceDC)
+			if err := dataChannel.SetWebSocket(mockContext, mockServiceDC, sessionId, clientId, onMessageHandler); err != nil {
 				return nil, fmt.Errorf("failed to create websocket for datachannel with error: %s", err)
 			}
 
+			dataChannel.wsChannel.SetUrl(u.String())
 			if err := dataChannel.Open(mockLog); err != nil {
 				return nil, fmt.Errorf("failed to open datachannel with error: %s", err)
 			}
@@ -215,9 +329,10 @@ func TestOpenDataChannel_OpenDataChannelError_RetryCount(t *testing.T) {
 	defer srv.Close()
 
 	createDataChannelOutput := service.CreateDataChannelOutput{TokenValue: &token}
-	mockService.On("CreateDataChannel", mock.Anything, mock.Anything, mock.Anything).Return(&createDataChannelOutput, nil)
-	mockService.On("GetRegion").Return(region)
-	mockService.On("GetV4Signer").Return(signer)
+	mockServiceDC := &serviceMock.Service{}
+	mockServiceDC.On("CreateDataChannel", mock.Anything, mock.Anything, mock.Anything).Return(&createDataChannelOutput, nil)
+	mockServiceDC.On("GetRegion").Return(region)
+	mockServiceDC.On("GetV4Signer").Return(signer)
 
 	counter := 0
 	// Get number of go-routines running
@@ -229,9 +344,9 @@ func TestOpenDataChannel_OpenDataChannelError_RetryCount(t *testing.T) {
 	retryer := retry.ExponentialRetryer{
 		CallableFunc: func() (channel interface{}, err error) {
 			counter++
-			dataChannel := getDataChannelRef()
+			dataChannel := getDataChannelRef(mockServiceDC)
 
-			if err := dataChannel.SetWebSocket(mockContext, mockService, sessionId, clientId, onMessageHandler); err != nil {
+			if err := dataChannel.SetWebSocket(mockContext, mockServiceDC, sessionId, clientId, onMessageHandler); err != nil {
 				return nil, fmt.Errorf("failed to create websocket for datachannel with error: %s", err)
 			}
 			dataChannel.wsChannel.SetUrl(u.String())
@@ -259,62 +374,10 @@ func TestOpenDataChannel_OpenDataChannelError_RetryCount(t *testing.T) {
 	assert.Equal(t, 6, counter)
 }
 
-func TestOpenDataChannel_OpenDataChannelError_RetryCount_AfterConnection(t *testing.T) {
-	// launch local HTTP Server
-	srv := httptest.NewServer(http.HandlerFunc(httpHandler))
-	u, _ := url.Parse(srv.URL)
-	u.Scheme = "ws"
-	defer srv.Close()
-
-	createDataChannelOutput := service.CreateDataChannelOutput{TokenValue: &token}
-	mockService.On("CreateDataChannel", mock.Anything, mock.Anything, mock.Anything).Return(&createDataChannelOutput, nil)
-	mockService.On("GetRegion").Return(region)
-	mockService.On("GetV4Signer").Return(signer)
-
-	counter := 0
-	// Get number of go-routines running
-	initialGRNumber := runtime.NumGoroutine()
-
-	startTime := time.Now()
-
-	// copied over from sessionplugin
-	retryer := retry.ExponentialRetryer{
-		CallableFunc: func() (channel interface{}, err error) {
-			counter++
-			dataChannel := getDataChannelRef()
-			dataChannel.wsChannel.SetUrl(u.String())
-			if err := dataChannel.SetWebSocket(mockContext, mockService, sessionId, clientId, onMessageHandler); err != nil {
-				return nil, fmt.Errorf("failed to create websocket for datachannel with error: %s", err)
-			}
-
-			if err := dataChannel.Open(mockLog); err != nil {
-				return nil, fmt.Errorf("failed to open datachannel with error: %s", err)
-			}
-			dataChannel.ResendStreamDataMessageScheduler(mockLog)
-			return dataChannel, nil
-		},
-		GeometricRatio:      mgsConfig.RetryGeometricRatio,
-		InitialDelayInMilli: rand.Intn(mgsConfig.DataChannelRetryInitialDelayMillis) + mgsConfig.DataChannelRetryInitialDelayMillis,
-		MaxDelayInMilli:     mgsConfig.DataChannelRetryMaxIntervalMillis,
-		MaxAttempts:         mgsConfig.DataChannelNumMaxAttempts,
-	}
-
-	retryer.Init()
-	_, err1 := retryer.Call()
-
-	assert.NotNil(t, err1)
-	completedGRNumber := runtime.NumGoroutine()
-	assert.True(t, math.Abs(startTime.Sub(time.Now()).Seconds()) < 10)
-	time.Sleep(20 * time.Second)
-	// make sure that only 2 additional goroutines should be running
-	assert.True(t, initialGRNumber+5 >= completedGRNumber)
-	assert.Equal(t, 6, counter)
-}
-
-func getDataChannelRef() *DataChannel {
+func getDataChannelRef(mockServiceDC service.Service) *DataChannel {
 	dataChannel := &DataChannel{}
 	dataChannel.Initialize(mockContext,
-		mockService,
+		mockServiceDC,
 		sessionId,
 		clientId,
 		instanceId,

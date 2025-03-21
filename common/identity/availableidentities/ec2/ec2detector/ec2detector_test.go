@@ -17,53 +17,57 @@ import (
 	"testing"
 
 	"github.com/aws/amazon-ssm-agent/agent/appconfig"
-	"github.com/aws/amazon-ssm-agent/common/identity/availableidentities/ec2/ec2detector/helper"
-	"github.com/aws/amazon-ssm-agent/common/identity/availableidentities/ec2/ec2detector/helper/mocks"
+	"github.com/aws/amazon-ssm-agent/agent/mocks/log"
+	"github.com/aws/amazon-ssm-agent/common/identity/availableidentities/ec2/ec2detector/mocks"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestIsEC2Instance(t *testing.T) {
+	logMock := log.NewMockLog()
 	detector := ec2Detector{}
 	trueSubDetector := &mocks.Detector{}
 	falseSubDetector := &mocks.Detector{}
+	temp := detectors
+	defer func() { detectors = temp }()
 
-	assert.False(t, detector.IsEC2Instance())
+	trueSubDetector.On("IsEc2", logMock).Return(true).Once()
+	detectors = []Detector{trueSubDetector}
+	assert.True(t, detector.IsEC2Instance(logMock))
 
-	trueSubDetector.On("IsEc2").Return(true).Once()
-	detector.detectors = []helper.Detector{trueSubDetector}
-	assert.True(t, detector.IsEC2Instance())
+	trueSubDetector.On("IsEc2", logMock).Return(true).Once()
+	detectors = []Detector{trueSubDetector, falseSubDetector}
+	assert.True(t, detector.IsEC2Instance(logMock))
 
-	trueSubDetector.On("IsEc2").Return(true).Once()
-	detector.detectors = []helper.Detector{trueSubDetector, falseSubDetector}
-	assert.True(t, detector.IsEC2Instance())
+	falseSubDetector.On("IsEc2", logMock).Return(false).Once()
+	trueSubDetector.On("IsEc2", logMock).Return(true).Once()
+	detectors = []Detector{falseSubDetector, trueSubDetector}
+	assert.True(t, detector.IsEC2Instance(logMock))
 
-	falseSubDetector.On("IsEc2").Return(false).Once()
-	trueSubDetector.On("IsEc2").Return(true).Once()
-	detector.detectors = []helper.Detector{falseSubDetector, trueSubDetector}
-	assert.True(t, detector.IsEC2Instance())
-
-	falseSubDetector.On("IsEc2").Return(false).Once()
-	detector.detectors = []helper.Detector{falseSubDetector}
-	assert.False(t, detector.IsEC2Instance())
+	falseSubDetector.On("IsEc2", logMock).Return(false).Once()
+	detectors = []Detector{falseSubDetector}
+	assert.False(t, detector.IsEC2Instance(logMock))
 
 	trueSubDetector.AssertExpectations(t)
 	falseSubDetector.AssertExpectations(t)
 }
 
 func TestIsEC2Instance_ConfiguredReturnValue(t *testing.T) {
+	logMock := log.NewMockLog()
 	detector := ec2Detector{}
 	subDetector := &mocks.Detector{}
+	temp := detectors
+	defer func() { detectors = temp }()
 
-	detector.detectors = []helper.Detector{subDetector}
+	detectors = []Detector{subDetector}
 	detector.config = appconfig.SsmagentConfig{Identity: appconfig.IdentityCfg{Ec2SystemInfoDetectionResponse: "true"}}
-	assert.True(t, detector.IsEC2Instance())
+	assert.True(t, detector.IsEC2Instance(logMock))
 
-	detector.detectors = []helper.Detector{subDetector}
+	detectors = []Detector{subDetector}
 	detector.config = appconfig.SsmagentConfig{Identity: appconfig.IdentityCfg{Ec2SystemInfoDetectionResponse: "false"}}
-	assert.False(t, detector.IsEC2Instance())
+	assert.False(t, detector.IsEC2Instance(logMock))
 
-	subDetector.On("IsEc2").Return(true).Once()
-	detector.detectors = []helper.Detector{subDetector}
+	subDetector.On("IsEc2", logMock).Return(true).Once()
+	detectors = []Detector{subDetector}
 	detector.config = appconfig.SsmagentConfig{Identity: appconfig.IdentityCfg{Ec2SystemInfoDetectionResponse: "unsupportedValue"}}
-	assert.True(t, detector.IsEC2Instance())
+	assert.True(t, detector.IsEC2Instance(logMock))
 }

@@ -215,14 +215,12 @@ func (controlChannel *ControlChannel) Open(context context.T, ableToOpenMGSConne
 	uuid.SwitchFormat(uuid.CleanHyphen)
 	uid := uuid.NewV4().String()
 
-	instancePlatformType, _ := platform.PlatformType(log)
-
 	openControlChannelInput := service.OpenControlChannelInput{
 		MessageSchemaVersion: aws.String(mgsConfig.MessageSchemaVersion),
 		RequestId:            aws.String(uid),
 		TokenValue:           aws.String(controlChannel.wsChannel.GetChannelToken()),
 		AgentVersion:         aws.String(version.Version),
-		PlatformType:         aws.String(instancePlatformType),
+		PlatformType:         aws.String(platform.PlatformType(log)),
 	}
 
 	jsonValue, err := json.Marshal(openControlChannelInput)
@@ -252,7 +250,7 @@ func controlChannelIncomingMessageHandler(context context.T,
 		log.Debugf("Invalid AgentMessage: %s, err: %v.", agentMessage.MessageId, err)
 		return err
 	}
-	log.Infof("received message through control channel %v", agentMessage.MessageId)
+	log.Debugf("received message through control channel %v", agentMessage.MessageId)
 	incomingAgentMessageChan <- *agentMessage
 	return nil
 }

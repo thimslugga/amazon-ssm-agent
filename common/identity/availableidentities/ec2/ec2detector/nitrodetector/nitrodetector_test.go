@@ -17,76 +17,44 @@
 package nitrodetector
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
-	"github.com/aws/amazon-ssm-agent/common/identity/availableidentities/ec2/ec2detector/helper/mocks"
+	"github.com/aws/amazon-ssm-agent/agent/log"
+	logger "github.com/aws/amazon-ssm-agent/agent/mocks/log"
+	"github.com/aws/amazon-ssm-agent/common/identity/availableidentities/ec2/ec2detector/helper"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 )
 
 func TestIsEc2(t *testing.T) {
-	helper := &mocks.DetectorHelper{}
-	detector := &nitroDetector{helper: helper}
+	detector := New("", "")
+	logMock := logger.NewMockLog()
+	tempMatchUuid := helper.MatchUuid
+	tempGetSystemInfo := helper.GetSystemInfo
+	defer func() {
+		helper.MatchUuid = tempMatchUuid
+		helper.GetSystemInfo = tempGetSystemInfo
+	}()
 
-	detector.uuid = "someuuid"
-	detector.vendor = "someothervendor"
-	assert.False(t, detector.IsEc2())
+	helper.GetSystemInfo = func(log.T, string) string { return "someothervendor" }
+	assert.False(t, detector.IsEc2(logMock))
 
-	detector.uuid = "someuuid"
-	detector.vendor = expectedNitroVendor + "-somepostfix"
-	assert.False(t, detector.IsEc2())
+	helper.GetSystemInfo = func(log.T, string) string { return fmt.Sprintf("%s%s", expectedNitroVendor, "-somepostfix") }
+	assert.False(t, detector.IsEc2(logMock))
 
-	detector.uuid = "someuuid"
-	detector.vendor = "someprefix-" + expectedNitroVendor
-	assert.False(t, detector.IsEc2())
+	helper.GetSystemInfo = func(log.T, string) string { return fmt.Sprintf("%s%s", "someprefix-", expectedNitroVendor) }
+	assert.False(t, detector.IsEc2(logMock))
 
-	helper.On("MatchUuid", mock.Anything).Return(false).Once()
-	detector.uuid = "someuuid"
-	detector.vendor = expectedNitroVendor
-	assert.False(t, detector.IsEc2())
+	helper.GetSystemInfo = func(log.T, string) string { return expectedNitroVendor }
+	helper.MatchUuid = func(log.T, string) bool { return false }
+	assert.False(t, detector.IsEc2(logMock))
 
-	helper.On("MatchUuid", mock.Anything).Return(true).Once()
-	detector.uuid = "someuuid"
-	detector.vendor = expectedNitroVendor
-	assert.True(t, detector.IsEc2())
+	helper.GetSystemInfo = func(log.T, string) string { return expectedNitroVendor }
+	helper.MatchUuid = func(log.T, string) bool { return true }
+	assert.True(t, detector.IsEc2(logMock))
 
-	helper.On("MatchUuid", mock.Anything).Return(true).Once()
-	detector.uuid = "someuuid"
-	detector.vendor = strings.ToUpper(expectedNitroVendor)
-	assert.True(t, detector.IsEc2())
-
-	helper.AssertExpectations(t)
-}
-
-func TestGetUuid(t *testing.T) {
-	helper := &mocks.DetectorHelper{}
-	detector := &nitroDetector{helper: helper}
-
-	helper.On("GetSystemInfo", nitroUuidSystemInfoParam).Return("").Once()
-	assert.Equal(t, "", detector.getUuid())
-	assert.Equal(t, "", detector.uuid)
-
-	helper.On("GetSystemInfo", nitroUuidSystemInfoParam).Return("something").Once()
-	assert.Equal(t, "something", detector.getUuid())
-	assert.Equal(t, "something", detector.uuid)
-	assert.Equal(t, "something", detector.getUuid())
-
-	helper.AssertExpectations(t)
-}
-
-func TestGetVendor(t *testing.T) {
-	helper := &mocks.DetectorHelper{}
-	detector := &nitroDetector{helper: helper}
-
-	helper.On("GetSystemInfo", nitroVendorSystemInfoParam).Return("").Once()
-	assert.Equal(t, "", detector.getVendor())
-	assert.Equal(t, "", detector.vendor)
-
-	helper.On("GetSystemInfo", nitroVendorSystemInfoParam).Return("something").Once()
-	assert.Equal(t, "something", detector.getVendor())
-	assert.Equal(t, "something", detector.vendor)
-	assert.Equal(t, "something", detector.getVendor())
-
-	helper.AssertExpectations(t)
+	helper.GetSystemInfo = func(log.T, string) string { return strings.ToUpper(expectedNitroVendor) }
+	helper.MatchUuid = func(log.T, string) bool { return true }
+	assert.True(t, detector.IsEc2(logMock))
 }

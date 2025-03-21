@@ -39,7 +39,6 @@ type EC2RoleProvider struct {
 	credentials.Expiry
 	InnerProviders         *EC2InnerProviders
 	Log                    log.T
-	Config                 *appconfig.SsmagentConfig
 	InstanceInfo           *ssmec2roleprovider.InstanceInfo
 	expirationUpdateLock   *sync.Mutex
 	credentialSource       string
@@ -49,7 +48,7 @@ type EC2RoleProvider struct {
 }
 
 // NewEC2RoleProvider initializes a new EC2RoleProvider using runtime config values
-func NewEC2RoleProvider(log log.T, config *appconfig.SsmagentConfig, innerProviders *EC2InnerProviders, instanceInfo *ssmec2roleprovider.InstanceInfo, ssmEndpoint string, runtimeConfigClient runtimeconfig.IIdentityRuntimeConfigClient) *EC2RoleProvider {
+func NewEC2RoleProvider(log log.T, innerProviders *EC2InnerProviders, instanceInfo *ssmec2roleprovider.InstanceInfo, ssmEndpoint string, runtimeConfigClient runtimeconfig.IIdentityRuntimeConfigClient) *EC2RoleProvider {
 	runtimeConfig, err := runtimeConfigClient.GetConfigWithRetry()
 	if err != nil {
 		log.Warnf("Failed to get credential source from runtime config. Err: %v", err)
@@ -67,7 +66,6 @@ func NewEC2RoleProvider(log log.T, config *appconfig.SsmagentConfig, innerProvid
 	return &EC2RoleProvider{
 		InnerProviders:         innerProviders,
 		Log:                    log.WithContext(ec2rolecreds.ProviderName),
-		Config:                 config,
 		InstanceInfo:           instanceInfo,
 		SsmEndpoint:            ssmEndpoint,
 		RuntimeConfigClient:    runtimeConfigClient,
@@ -84,6 +82,14 @@ func (p *EC2RoleProvider) GetInnerProvider() IInnerProvider {
 	}
 
 	return p.InnerProviders.IPRProvider
+}
+
+// GetInstanceRegion gets the region of the instance for this provider.
+func (p *EC2RoleProvider) GetInstanceRegion() string {
+	if p.InstanceInfo == nil {
+		return "" // Should never happen with proper initialization
+	}
+	return p.InstanceInfo.Region
 }
 
 // RetrieveWithContext returns shared credentials if specified in runtime config
@@ -107,6 +113,9 @@ func (p *EC2RoleProvider) RetrieveWithContext(ctx context.Context) (credentials.
 
 	iprCredentials, err := p.InnerProviders.IPRProvider.RetrieveWithContext(ctx)
 	if err != nil {
+		if awsErr := sdkutil.GetAwsError(err); awsErr != nil {
+			err = awserr.New(awsErr.Code(), awsErr.Message(), nil)
+		}
 		err = fmt.Errorf("failed to retrieve instance profile role credentials. Err: %w", err)
 		p.Log.Error(err)
 		return iprEmptyCredential, err
@@ -181,9 +190,9 @@ func (p *EC2RoleProvider) iprCredentials(ctx context.Context, ssmEndpoint string
 
 // updateEmptyInstanceInformation calls UpdateInstanceInformation with minimal parameters
 func (p *EC2RoleProvider) updateEmptyInstanceInformation(ctx context.Context, ssmEndpoint string, roleCredentials *credentials.Credentials) error {
-	ssmClient := newV4ServiceWithCreds(p.Log.WithContext("SSMService"), p.Config, roleCredentials, p.InstanceInfo.Region, ssmEndpoint)
+	ssmClient := newV4ServiceWithCreds(p.Log.WithContext("SSMService"), roleCredentials, p.GetInstanceRegion(), ssmEndpoint)
 
-	p.Log.Debugf("Calling UpdateInstanceInformation with agent version %s", p.Config.Agent.Version)
+	p.Log.Debugf("Calling UpdateInstanceInformation")
 	// Call update instance information with instance profile role
 	input := &ssm.UpdateInstanceInformationInput{
 		AgentName:    aws.String(agentName),
@@ -202,6 +211,11 @@ func (p *EC2RoleProvider) updateEmptyInstanceInformation(ctx context.Context, ss
 	}
 
 	_, err := ssmClient.UpdateInstanceInformationWithContext(ctx, input)
+	if err != nil {
+		if awsErr := sdkutil.GetAwsError(err); awsErr != nil {
+			err = awserr.New(awsErr.Code(), awsErr.Message(), nil)
+		}
+	}
 	return err
 }
 

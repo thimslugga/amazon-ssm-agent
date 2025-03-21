@@ -55,15 +55,13 @@ func DeleteFile(filepath string) (err error) {
 
 // DeleteDirectory deletes a directory and all its content.
 func DeleteDirectory(dirName string) (err error) {
-
 	return os.RemoveAll(dirName)
 }
 
 // ReadAllText reads all content from the specified file
 func ReadAllText(filePath string) (text string, err error) {
-	var exists = false
-	exists, err = LocalFileExist(filePath)
-	if err != nil || exists == false {
+	exists, err := LocalFileExist(filePath)
+	if err != nil || !exists {
 		return
 	}
 
@@ -128,6 +126,25 @@ func BuildPath(root string, elements ...string) string {
 	return fullPath
 }
 
+// BuildSafePath joins the directory, but returns the root directory if the subpaths attempt
+// to recurse above the provided root
+func BuildSafePath(root string, elements ...string) string {
+	root = filepath.Clean(root)
+	fullPath := root
+	for _, element := range elements {
+		cleanElement := removeInvalidColon(element)
+
+		newPath := filepath.Join(fullPath, cleanElement)
+		newPath = filepath.Clean(newPath)
+
+		if !strings.HasPrefix(newPath, root) {
+			return root
+		}
+		fullPath = newPath
+	}
+	return fullPath
+}
+
 // BuildS3Path joins the root directory path with valid components.
 func BuildS3Path(root string, elements ...string) string {
 	fullPath := root
@@ -177,7 +194,6 @@ func GetFileMode(path string) (mode os.FileMode) {
 // IsDirectory returns true or false depending
 // if given srcPath is directory or not
 func IsDirectory(srcPath string) bool {
-
 	srcFileInfo, err := fs.Stat(srcPath)
 	if err != nil {
 		err = fmt.Errorf("error looking up path information Path: %v, Error: %v", srcPath, err)
@@ -190,7 +206,6 @@ func IsDirectory(srcPath string) bool {
 // IsFile returns true or false depending if given
 // srcPath is a regular file or not
 func IsFile(srcPath string) bool {
-
 	srcFileInfo, err := fs.Stat(srcPath)
 	if err != nil {
 		err = fmt.Errorf("error looking up path information Path: %v, Error: %v", srcPath, err)
@@ -239,7 +254,6 @@ func WriteIntoFileWithPermissionsExtended(absolutePath, content string, perm os.
 
 // GetFileModificationTime returns the modification time of the file
 func GetFileModificationTime(srcPath string) (modificationTime time.Time, err error) {
-
 	srcFileInfo, err := fs.Stat(srcPath)
 	if err != nil {
 		err = fmt.Errorf("error looking up file information: %v, Error: %v", srcPath, err)
@@ -302,6 +316,25 @@ func GetDirectoryNamesUnsortedOlderThan(srcPath string, olderThan *time.Time) ([
 		}
 	}
 	return directories, nil
+}
+
+// GetFileNamesUnsortedLaterThan returns directory name unsorted ioutil.ReadDir uses sorting to sort the directory names
+// if date value passed in laterThan param, this function returns all files after the passed time.
+func GetFileNamesUnsortedLaterThan(srcPath string, laterThan *time.Time) ([]string, error) {
+	var err error
+	fileNames := make([]string, 0)
+	fileInfoList, err := getAllDirectoriesWithFileInfo(srcPath)
+	if err != nil {
+		return fileNames, err
+	}
+	for _, fileInfo := range fileInfoList {
+		if !fileInfo.Mode().IsDir() {
+			if laterThan == nil || (laterThan != nil && fileInfo.ModTime().After(*laterThan)) {
+				fileNames = append(fileNames, fileInfo.Name())
+			}
+		}
+	}
+	return fileNames, nil
 }
 
 // GetDirectoryNames returns the names of all directories under a give srcPath
@@ -466,7 +499,6 @@ func CollectFilesAndRebase(sourceDir, rebaseToDir string) (files []string, err e
 
 			return err
 		})
-
 	if err != nil {
 		return nil, fmt.Errorf("Cannot acknowledge downloaded files: %v", err.Error())
 	}

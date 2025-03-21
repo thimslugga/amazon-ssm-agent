@@ -16,20 +16,28 @@ package ec2detector
 
 import (
 	"github.com/aws/amazon-ssm-agent/agent/appconfig"
-	"github.com/aws/amazon-ssm-agent/common/identity/availableidentities/ec2/ec2detector/helper"
+	"github.com/aws/amazon-ssm-agent/agent/log"
 )
+
+type Detector interface {
+	// IsEc2 returns true if detector detects attributes indicating it is a ec2 instance
+	IsEc2(log log.T) bool
+	// GetName returns the name of the detector
+	GetName() string
+}
 
 type Ec2Detector interface {
 	// IsEC2Instance returns true if any sub detector detects it is running on EC2
-	IsEC2Instance() bool
+	IsEC2Instance(log log.T) bool
 }
 
 type ec2Detector struct {
-	detectors []helper.Detector
-	config    appconfig.SsmagentConfig
+	config appconfig.SsmagentConfig
 }
 
-func (e *ec2Detector) IsEC2Instance() bool {
+var detectors []Detector
+
+func (e *ec2Detector) IsEC2Instance(log log.T) bool {
 	if e.config.Identity.Ec2SystemInfoDetectionResponse != "" {
 		switch e.config.Identity.Ec2SystemInfoDetectionResponse {
 		case "true":
@@ -39,8 +47,8 @@ func (e *ec2Detector) IsEC2Instance() bool {
 		}
 	}
 
-	for _, detector := range e.detectors {
-		if detector.IsEc2() {
+	for _, detector := range detectors {
+		if detector.IsEc2(log) {
 			return true
 		}
 	}
@@ -48,10 +56,13 @@ func (e *ec2Detector) IsEC2Instance() bool {
 	return false
 }
 
+func RegisterDetector(detector Detector) {
+	detectors = append(detectors, detector)
+}
+
 // New returns a struct implementing the EC2Detector interface to detect if we are running on ec2
 func New(config appconfig.SsmagentConfig) *ec2Detector {
 	return &ec2Detector{
-		helper.GetAllDetectors(),
 		config,
 	}
 }

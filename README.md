@@ -190,8 +190,8 @@ To set up your own custom configuration for the agent:
     * SessionLogsRetentionDurationHours (int)
         * Default: 336
     * SessionLogsDestination (string) - Configure where you want Session Manager to write session data.
-        * Default: "disk" - Write session data to disk.
-        * OptionalValue: "none" - Don't write session data anywhere when CloudWatch and S3 logging are disabled.
+        * Default: "none" - Don't write session data anywhere when CloudWatch and S3 logging are disabled.
+        * OptionalValue: "disk" - Write session data to disk.
     * PluginLocalOutputCleanup (string) - Configure when after execution it is safe to delete local plugin output logs in orchestration folder
         * Default: "" - Don't delete logs immediately after execution. Fall back to AssociationLogsRetentionDurationHours, RunCommandLogsRetentionDurationHours, and SessionLogsRetentionDurationHours 
         * OptionalValue: "after-execution" - Delete plugin output file locally after plugin execution
@@ -239,6 +239,8 @@ To set up your own custom configuration for the agent:
     * LogKey (string) - Ignored
 * Kms - represents configuration for Key Management Service if encryption is enabled for this session (i.e. kmsKeyId is set or using "Port" plugin) 
     * Endpoint (string)
+    * RequireKMSChallengeResponse (boolean) - if true, enforces that Session Manager clients support enhanced challenge-response authentication
+        * Default: false
 
 ## Release
 
